@@ -1,0 +1,642 @@
+%% =======================================================================
+%  Vibration-Immune Smart Digital Weighing Scale
+%  DSP Algorithm Validation Script (MATLAB)
+%
+%  Target hardware : STM32F411CEU6 + HX711 (80 SPS) + Load Cell + OLED
+%  Purpose         : Validate the FIR filtering + FFT vibration-detection
+%                    chain BEFORE porting to CMSIS-DSP (arm_fir_f32,
+%                    arm_rfft_fast_f32) on the STM32F411.
+%
+%  ARCHITECTURE (matches firmware exactly - single sample loop)
+%  --------------------------------------------------------------------
+%  On the MCU, samples arrive ONE AT A TIME from the HX711 (interrupt /
+%  polling driven). There is no "whole array" available up front. Every
+%  incoming sample is consumed by TWO parallel stages inside the SAME
+%  loop iteration:
+%
+%     (1) arm_fir_f32()      -> running "stable weight" output (OLED)
+%     (2) raw ring buffer    -> fills up; every 256 samples,
+%                               arm_rfft_fast_f32() runs once on that
+%                               block for vibration diagnostics
+%
+%  The FFT branch intentionally uses RAW samples, not the FIR output.
+%  The FIR cutoff (5 Hz) is designed to reject the 20 Hz mechanical
+%  vibration so the display is stable; if the FFT ran on the filtered
+%  signal, the vibration tone would already be gone and undetectable.
+%  This script processes sample-by-sample in one for-loop to mirror
+%  that firmware structure exactly -- no whole-array pre-filtering,
+%  no whole-array pre-FFT.
+%  --------------------------------------------------------------------
+%
+%  No GUI, no virtual OLED, no pause()/animations. Pure DSP validation.
+% =========================================================================
+
+clear; clc; close all;
+
+%% ------------------------- 1. SYSTEM PARAMETERS ------------------------
+Fs        = single(80);     % Hz, HX711 sample rate (80 SPS mode)
+NFFT      = 256;             % FFT size for vibration analysis (block length)
+firOrder  = 40;               % FIR order (41 taps) -> even order, integer delay
+fc        = single(5);       % Hz, FIR cutoff frequency
+groupDelay = firOrder / 2;    % samples, linear-phase FIR group delay
+
+noiseStd_kg     = single(0.01);   % Gaussian sensor noise std-dev
+
+% -------------------------------------------------------------------
+% VIBRATION TEST CASE SELECTOR
+% Change ONLY this variable to switch the vibration environment used
+% for validation. All downstream code (FIR, FFT, RMS, plots) is
+% identical for every case -- only generateVibration() below changes
+% what it returns. Nyquist limit is Fs/2 = 40 Hz; every test case is
+% constructed to stay strictly below that.
+%
+%   1 = Baseline               : weight + noise, no vibration
+%   2 = Single Machine         : weight + 20 Hz vibration + noise
+%   3 = Multiple Machines      : weight + 10/20/35 Hz vibration + noise
+%   4 = Variable Machine Speed : weight + vibration whose frequency
+%                                changes with time (10->25->35 Hz)
+%   5 = Random Industrial Env. : weight + sum of random-amplitude,
+%                                random-phase sinusoids + noise
+% -------------------------------------------------------------------
+testCase = 2;
+
+testCaseNames = { 'Baseline', 'Single Machine', ...
+                  'Multiple Industrial Machines', ...
+                  'Variable Machine Speed', ...
+                  'Random Industrial Environment' };
+scenarioName = testCaseNames{testCase};
+
+% -------------------------------------------------------------------
+% KNOWN VIBRATION SOURCE DATABASE (for foreign-system identification)
+% Maps a known machine/frequency signature to a human-readable name.
+% This represents prior knowledge of what's physically near the scale
+% (e.g. from a plant survey) -- EDIT this list to match your actual
+% installation site. It is independent of testCase: the algorithm does
+% not know which scenario is running, it only sees a detected frequency
+% and looks it up here, exactly like the firmware would.
+% -------------------------------------------------------------------
+machineDB = struct( ...
+    'name', { 'Ball Mill / Rotary Drum', 'Rooftop AC Unit', 'Cooling Tower Fan', ...
+              'Conveyor Motor', 'HVAC Blower', 'Chiller Compressor', ...
+              'Hydraulic Pump', 'Packaging Press', 'CNC Spindle (Low Speed)', ...
+              'Compressor Pump', 'Vibrating Feeder', 'Boiler Feed Pump', ...
+              'Air Handler', 'Exhaust Fan', 'Backup Generator' }, ...
+    'freq', {  3,                        5,                 7, ...
+               10,                       12,                15, ...
+               18,                       20,                23, ...
+               25,                       28,                30, ...
+               32,                       35,                38 } );
+
+sourceToleranceHz = 1.0;   % Hz, matching window for source ID.
+                           % FFT bin resolution = Fs/NFFT = 0.3125 Hz,
+                           % so 1.0 Hz gives margin for real-world drift.
+                           % Minimum spacing in machineDB is 2 Hz (e.g.
+                           % 3 & 5 Hz, 28 & 30 Hz) so every entry stays
+                           % individually resolvable at this tolerance;
+                           % if you add machines closer together than
+                           % that, tighten sourceToleranceHz accordingly.
+
+% HX711 is a 24-bit ADC. Simulate quantization over an assumed load-cell
+% full-scale range so the DSP chain sees a realistically quantized
+% signal rather than continuous double-precision values.
+adcBits       = 24;
+adcFullScale_kg = single(5.0);              % assumed load-cell rated capacity
+adcResolution_kg = adcFullScale_kg / single(2^(adcBits-1));
+
+numBlocks    = 8;                  % number of 256-sample FFT blocks to run
+totalSamples = numBlocks * NFFT;   % 2048 samples @ 80 Hz = 25.6 s of data
+
+fprintf('=== Simulation Parameters ===\n');
+fprintf('Fs = %g Hz | NFFT = %d | FIR order = %d | fc = %g Hz | precision = single\n', ...
+        Fs, NFFT, firOrder, fc);
+fprintf('Test Case %d: %s\n\n', testCase, scenarioName);
+
+%% ------------------------- 2. FIR FILTER DESIGN --------------------------
+% Windowed-sinc low-pass FIR, Hamming window -- these coefficients are
+% exactly what would be exported as a float32 array for arm_fir_f32().
+Wn = double(fc) / (double(Fs)/2);
+firCoeffs = single(fir1(firOrder, Wn, hamming(firOrder+1)));
+firCoeffs = firCoeffs(:)';   % row vector, single precision
+
+%% ------------------- 3. DYNAMIC WEIGHT PROFILE (GROUND TRUTH) ------------
+% Real scale behaviour: idle (0 kg) -> object placed (smooth ramp up) ->
+% stable 2 kg -> object removed (smooth ramp down) -> idle (0 kg).
+% This is far more meaningful for evaluating FIR transient response than
+% a constant weight.
+n = single(0:totalSamples-1);
+t = n / Fs;
+
+targetWeight_kg = single(2.0);
+rampDuration_s  = single(1.0);      % time to place/remove the object
+
+placeStart_s  = single(4.0);
+stableEnd_s   = single(15.0);
+removeEnd_s   = stableEnd_s + rampDuration_s;
+
+idealWeight = zeros(1, totalSamples, 'single');
+for k = 1:totalSamples
+    tk = t(k);
+    if tk < placeStart_s
+        w = single(0);
+    elseif tk < placeStart_s + rampDuration_s
+        % smooth raised-cosine ramp up (object being placed)
+        frac = (tk - placeStart_s) / rampDuration_s;
+        w = targetWeight_kg * 0.5 * (1 - cos(pi*frac));
+    elseif tk < stableEnd_s
+        w = targetWeight_kg;
+    elseif tk < removeEnd_s
+        % smooth raised-cosine ramp down (object being removed)
+        frac = (tk - stableEnd_s) / rampDuration_s;
+        w = targetWeight_kg * 0.5 * (1 + cos(pi*frac));
+    else
+        w = single(0);
+    end
+    idealWeight(k) = w;
+end
+
+%% ------------------------- 4. SIGNAL GENERATION --------------------------
+% Load Cell Signal = Weight + Vibration + Noise, then ADC-quantized.
+% Mechanical vibration is an external disturbance (e.g. floor/motor
+% vibration) present regardless of whether an object is on the scale.
+%
+% The vibration content itself is the ONLY thing that changes between
+% test cases -- generateVibration() encapsulates all five scenarios so
+% the rest of the pipeline (FIR, ring buffer, FFT, RMS, plots) never
+% needs to know which test case is active.
+vibration = generateVibration(t, Fs, testCase);
+noise     = noiseStd_kg * single(randn(1, totalSamples));
+
+rawSignalContinuous = idealWeight + vibration + noise;
+rawSignal = quantizeADC(rawSignalContinuous, adcResolution_kg);   % simulated HX711 output
+
+%% ---- 5. MAIN REAL-TIME LOOP: FIR + RAW BUFFER + FFT RUN CONCURRENTLY ----
+% This single loop is the direct MATLAB analogue of the STM32 firmware
+% main loop / sample-ready ISR. Every sample is consumed once by the
+% FIR filter AND once by the raw ring buffer in the SAME iteration.
+
+filteredSignal = zeros(1, totalSamples, 'single');   % "stable weight" output
+delayLine      = zeros(1, firOrder+1, 'single');      % FIR state buffer
+
+rawRingBuffer  = zeros(1, NFFT, 'single');
+bufferIndex    = 0;
+
+hammingWin = single(hamming(NFFT)');
+coherentGain = sum(hammingWin) / NFFT;
+
+detectedFreqPerBlock = [];   % Hz, one entry per completed FFT block
+blockCenterTime      = [];   % s, time at which each block completed
+lastMagSpectrum      = [];   % kept for plotting (last completed block)
+lastFreqAxis         = [];
+lastPeakIdx          = [];
+
+dominantSourcePerBlock    = {};   % identified name for the single strongest peak
+allDetectedFreqsPerBlock  = {};   % ALL significant peak frequencies per block
+identifiedSourcesPerBlock = {};   % identified name for each of those peaks
+
+for k = 1:totalSamples
+
+    x = rawSignal(k);
+
+    % --- Consumer 1: real-time causal FIR filter (arm_fir_f32 analogue)
+    [y, delayLine] = firStep(x, firCoeffs, delayLine);
+    filteredSignal(k) = y;
+
+    % --- Consumer 2: raw ring buffer for vibration FFT (parallel branch)
+    bufferIndex = bufferIndex + 1;
+    rawRingBuffer(bufferIndex) = x;
+
+    if bufferIndex >= NFFT
+        % Buffer full -> run FFT vibration analysis on this block
+        windowedBlock = rawRingBuffer .* hammingWin;
+        Y = fft(double(windowedBlock), NFFT);   % fft() requires double input
+
+        magSpectrum = abs(Y(1:NFFT/2+1)) / (NFFT * double(coherentGain));
+        magSpectrum(2:end-1) = 2 * magSpectrum(2:end-1);
+        freqAxis = (0:NFFT/2) * (double(Fs)/NFFT);
+
+        [peakIdx, peakFound] = detectDominantPeak(magSpectrum, 0.005);
+
+        if peakFound
+            detectedFreqPerBlock(end+1) = freqAxis(peakIdx); %#ok<SAGROW>
+        else
+            detectedFreqPerBlock(end+1) = NaN; %#ok<SAGROW>
+        end
+        blockCenterTime(end+1) = double(t(k)); %#ok<SAGROW>
+
+        lastMagSpectrum = magSpectrum;
+        lastFreqAxis    = freqAxis;
+        lastPeakIdx     = peakIdx;
+
+        % --- Source identification: match the dominant peak, and
+        %     separately ALL significant peaks (for multi-machine
+        %     scenarios), against the known machine database ---
+        if peakFound
+            dominantName = identifySources(freqAxis(peakIdx), machineDB, sourceToleranceHz);
+            dominantSourcePerBlock{end+1} = dominantName{1}; %#ok<SAGROW>
+        else
+            dominantSourcePerBlock{end+1} = 'None (no vibration detected)'; %#ok<SAGROW>
+        end
+
+        allPeakIdxList    = detectAllPeaks(magSpectrum, 0.005);
+        allFreqsThisBlock = freqAxis(allPeakIdxList);
+
+        allDetectedFreqsPerBlock{end+1}  = allFreqsThisBlock; %#ok<SAGROW>
+        identifiedSourcesPerBlock{end+1} = identifySources(allFreqsThisBlock, machineDB, sourceToleranceHz); %#ok<SAGROW>
+
+        % Reset ring buffer for next block (matches circular index reset
+        % in firmware; a true circular buffer could instead slide, but a
+        % non-overlapping reset is simplest and matches the block diagram)
+        bufferIndex = 0;
+    end
+end
+
+fprintf('=== FFT Vibration Detection & Source Identification (per 256-sample block) | %s ===\n', scenarioName);
+for b = 1:numBlocks
+    fprintf('Block %d (t = %5.2f s): dominant = %6.2f Hz -> %s\n', ...
+            b, blockCenterTime(b), detectedFreqPerBlock(b), dominantSourcePerBlock{b});
+
+    if numel(allDetectedFreqsPerBlock{b}) > 1
+        % More than one significant peak this block -> likely several
+        % machines vibrating simultaneously (Test Cases 3 and 5).
+        parts = cell(1, numel(allDetectedFreqsPerBlock{b}));
+        for i = 1:numel(parts)
+            parts{i} = sprintf('%s (%.2f Hz)', ...
+                identifiedSourcesPerBlock{b}{i}, allDetectedFreqsPerBlock{b}(i));
+        end
+        fprintf('    All sources this block : %s\n', strjoin(parts, ', '));
+    end
+end
+fprintf('\n');
+
+% Run summary: which distinct foreign systems were identified overall.
+% This is the direct answer to "which foreign system is causing this
+% vibration?" -- aggregated across the whole simulation run.
+fprintf('=== Summary: Foreign Vibration Sources Identified This Run | %s ===\n', scenarioName);
+allNamesSeen = [dominantSourcePerBlock, identifiedSourcesPerBlock{:}];
+uniqueSources = unique(allNamesSeen, 'stable');
+for i = 1:numel(uniqueSources)
+    fprintf('  - %s\n', uniqueSources{i});
+end
+fprintf('\n');
+
+%% ---------------- 6. GROUP-DELAY COMPENSATION FOR RMS ---------------------
+% A causal FIR of even order N has an exact linear-phase group delay of
+% N/2 samples. filteredSignal(k) corresponds to the input at time
+% (k - groupDelay). Realign before computing error metrics.
+
+rawRMSError = sqrt(mean((double(rawSignal) - double(idealWeight)).^2));
+
+alignedFiltered = filteredSignal(groupDelay+1:end);
+alignedIdeal    = idealWeight(1:end-groupDelay);
+filteredRMSError = sqrt(mean((double(alignedFiltered) - double(alignedIdeal)).^2));
+
+fprintf('=== Performance Evaluation | %s ===\n', scenarioName);
+fprintf('Raw RMS Error       : %.6f kg\n', rawRMSError);
+fprintf('Filtered RMS Error  : %.6f kg (delay-compensated by %d samples)\n\n', ...
+        filteredRMSError, groupDelay);
+
+%% ------------------------------- 7. PLOTS ---------------------------------
+figure('Name', sprintf('Weighing Scale DSP Validation - %s', scenarioName), 'NumberTitle', 'off');
+
+subplot(3,2,1);
+plot(double(t), double(idealWeight), 'k', 'LineWidth', 1.2);
+xlabel('Time (s)'); ylabel('Weight (kg)');
+title(sprintf('1. Ideal Weight Profile - %s', scenarioName));
+grid on;
+
+subplot(3,2,2);
+plot(double(t), double(rawSignal), 'r');
+xlabel('Time (s)'); ylabel('Weight (kg)');
+title(sprintf('2. Raw HX711 Signal (quantized) - %s', scenarioName));
+grid on;
+
+subplot(3,2,3);
+plot(double(t), double(filteredSignal), 'b');
+xlabel('Time (s)'); ylabel('Weight (kg)');
+title(sprintf('3. FIR Filtered Signal (group delay = %d samples) - %s', groupDelay, scenarioName));
+grid on;
+
+subplot(3,2,4);
+plot(lastFreqAxis, lastMagSpectrum, 'm', 'LineWidth', 1.2);
+hold on;
+plot(lastFreqAxis(lastPeakIdx), lastMagSpectrum(lastPeakIdx), 'ko', 'MarkerFaceColor', 'k');
+xlabel('Frequency (Hz)'); ylabel('Magnitude (kg)');
+title(sprintf('4. FFT Spectrum, Last Block (Peak = %.2f Hz)', lastFreqAxis(lastPeakIdx)));
+grid on;
+
+subplot(3,2,[5 6]);
+stem(blockCenterTime, detectedFreqPerBlock, 'filled');
+hold on;
+% Reference line(s) showing the TRUE vibration frequency/frequencies for
+% this scenario, so detection accuracy can be checked visually. Test
+% cases with multiple or time-varying frequencies get multiple lines;
+% the baseline case (no vibration) gets none.
+referenceFreqs = getReferenceFrequencies(testCase);
+for rf = referenceFreqs
+    yline(rf, '--k', sprintf('%g Hz', rf), 'LabelHorizontalAlignment', 'left');
+end
+for b = 1:numBlocks
+    if ~isnan(detectedFreqPerBlock(b))
+        text(blockCenterTime(b), detectedFreqPerBlock(b) + 1.5, dominantSourcePerBlock{b}, ...
+             'FontSize', 7, 'Rotation', 25, 'HorizontalAlignment', 'left');
+    end
+end
+xlabel('Time (s)'); ylabel('Detected Frequency (Hz)');
+title(sprintf('5. Dominant Vibration Frequency & Identified Source per Block - %s', scenarioName));
+ylim([0, double(Fs)/2]);
+grid on;
+
+%% ===================== LOCAL FUNCTIONS (script-local) =====================
+function [y, delayLineOut] = firStep(x, coeffs, delayLineIn)
+% firStep  Single-sample causal FIR update using a tapped delay line.
+%
+%   Mirrors the internal structure of CMSIS-DSP's arm_fir_f32(): the
+%   state buffer is shifted, the new sample inserted, and the output is
+%   the dot product of coefficients with the state buffer. Porting to C
+%   only requires replacing this function body with a single call to
+%   arm_fir_f32() using an identical float32 coefficient array.
+%
+%   Inputs:
+%     x           - new input sample (single, scalar)
+%     coeffs      - FIR coefficient row vector (single), length numTaps
+%     delayLineIn - current state buffer (single), length numTaps
+%
+%   Outputs:
+%     y            - filtered output sample (single)
+%     delayLineOut - updated state buffer (single)
+
+    delayLineOut = [x, delayLineIn(1:end-1)];
+    y = coeffs * delayLineOut';
+end
+
+function [peakIdx, found] = detectDominantPeak(magSpectrum, thresholdKg)
+% detectDominantPeak  Robust dominant-frequency detection.
+%
+%   Rather than blindly taking max(magSpectrum) (which is fooled by
+%   harmonics or a noisy DC/near-DC region), this:
+%     1. Ignores the DC bin (index 1).
+%     2. Finds local maxima (bin(i-1) < bin(i) > bin(i+1)).
+%     3. Keeps only local maxima above an absolute magnitude threshold.
+%     4. Returns the largest surviving peak.
+%
+%   Inputs:
+%     magSpectrum - single-sided magnitude spectrum, bin 1 = DC
+%     thresholdKg - minimum peak magnitude to be considered real
+%                   (rejects noise-floor local maxima)
+%
+%   Outputs:
+%     peakIdx - bin index of the dominant peak (1-based, into magSpectrum)
+%     found   - true if a peak above threshold was found
+
+    found = false;
+    peakIdx = 2;   % default: first non-DC bin, overwritten if a peak is found
+    bestMag = -inf;
+
+    for i = 3:length(magSpectrum)-1
+        isLocalMax = magSpectrum(i) > magSpectrum(i-1) && ...
+                     magSpectrum(i) > magSpectrum(i+1);
+        if isLocalMax && magSpectrum(i) >= thresholdKg && magSpectrum(i) > bestMag
+            bestMag = magSpectrum(i);
+            peakIdx = i;
+            found = true;
+        end
+    end
+end
+
+function xq = quantizeADC(x, resolution)
+% quantizeADC  Simulate fixed-resolution ADC quantization (HX711, 24-bit).
+%
+%   Inputs:
+%     x          - continuous-valued signal (single)
+%     resolution - quantization step size in kg (single)
+%
+%   Output:
+%     xq - quantized signal (single), same size as x
+
+    xq = round(x / resolution) * resolution;
+end
+
+function vib = generateVibration(t, Fs, testCase)
+% generateVibration  Produce the mechanical vibration component of the
+%                     load-cell signal for the selected industrial test
+%                     case. This is the ONLY place the vibration
+%                     environment is defined -- everything downstream
+%                     (FIR, ring buffer, FFT, RMS) is unchanged and
+%                     scenario-agnostic.
+%
+%   All frequencies used here are kept strictly below the Nyquist
+%   frequency (Fs/2 = 40 Hz for Fs = 80 Hz), as required by the HX711
+%   80 SPS sample rate.
+%
+%   Inputs:
+%     t        - time vector (single), seconds
+%     Fs       - sample rate (single), Hz
+%     testCase - 1..5, selects the vibration scenario
+%
+%   Output:
+%     vib - vibration signal (single), same size as t, in kg
+
+    N = length(t);
+    td = double(t);       % double precision for trig args only
+    nyquist = double(Fs) / 2;
+
+    switch testCase
+
+        case 1
+            % --- Baseline: no vibration, weight + noise only ---
+            vib = zeros(1, N, 'single');
+
+        case 2
+            % --- Single Machine: one 20 Hz vibration source ---
+            f = 20; A = 0.05;
+            assert(f < nyquist, 'Vibration frequency exceeds Nyquist limit.');
+            vib = single(A * sin(2*pi*f*td));
+
+        case 3
+            % --- Multiple Industrial Machines: several fixed tones,
+            %     each with a different amplitude ---
+            freqs = [10, 20, 35];          % Hz
+            amps  = [0.03, 0.02, 0.015];   % kg
+            assert(all(freqs < nyquist), 'Vibration frequency exceeds Nyquist limit.');
+            vibD = zeros(1, N);
+            for i = 1:numel(freqs)
+                vibD = vibD + amps(i) * sin(2*pi*freqs(i)*td);
+            end
+            vib = single(vibD);
+
+        case 4
+            % --- Variable Machine Speed: frequency changes with time
+            %     (simulated motor RPM change), phase-continuous ---
+            vib = generateVariableSpeedVibration(t, Fs);
+
+        case 5
+            % --- Random Industrial Environment: sum of sinusoids with
+            %     random amplitude and random phase (factory floor) ---
+            freqs = [8, 12, 18, 25, 32, 38];   % Hz
+            assert(all(freqs < nyquist), 'Vibration frequency exceeds Nyquist limit.');
+
+            rng(1);   % fixed seed for repeatable validation runs;
+                      % remove this line for a different random draw
+                      % each time the script is run
+            amps   = 0.01 + (0.03 - 0.01) * rand(1, numel(freqs));   % kg
+            phases = 2*pi * rand(1, numel(freqs));                   % rad
+
+            vibD = zeros(1, N);
+            for i = 1:numel(freqs)
+                vibD = vibD + amps(i) * sin(2*pi*freqs(i)*td + phases(i));
+            end
+            vib = single(vibD);
+
+        otherwise
+            error('Unknown testCase %d. Valid values are 1-5.', testCase);
+    end
+end
+
+function vib = generateVariableSpeedVibration(t, Fs)
+% generateVariableSpeedVibration  Vibration whose frequency changes with
+%                                  time in discrete steps, simulating a
+%                                  motor/machine changing RPM.
+%
+%   Frequency profile:
+%     0-8 s   : 10 Hz
+%     8-16 s  : 25 Hz
+%     16-24 s : 35 Hz
+%     >24 s   : holds at 35 Hz
+%
+%   The instantaneous frequency is INTEGRATED into a continuous phase
+%   (rather than restarting sin(2*pi*f*t) at each segment boundary) so
+%   there is no phase discontinuity -- a discontinuity would inject
+%   broadband spectral leakage into the FFT that has nothing to do with
+%   the vibration itself.
+%
+%   Inputs:
+%     t  - time vector (single), seconds
+%     Fs - sample rate (single), Hz
+%
+%   Output:
+%     vib - vibration signal (single), same size as t, in kg
+
+    amplitude = 0.04;   % kg
+    td = double(t);
+    N = length(td);
+
+    freqProfile = zeros(1, N);
+    for k = 1:N
+        tk = td(k);
+        if tk < 8
+            freqProfile(k) = 10;
+        elseif tk < 16
+            freqProfile(k) = 25;
+        else
+            freqProfile(k) = 35;
+        end
+    end
+
+    % Integrate instantaneous frequency (Hz) over the sample interval
+    % (1/Fs) to obtain a continuous phase in radians.
+    phase = 2*pi * cumsum(freqProfile) / double(Fs);
+    vib = single(amplitude * sin(phase));
+end
+
+function peakIdxList = detectAllPeaks(magSpectrum, thresholdKg)
+% detectAllPeaks  Find ALL significant local-maxima peaks in a magnitude
+%                 spectrum, not just the single strongest one.
+%
+%   Used for identifying multiple simultaneous vibration sources (e.g.
+%   several machines on a factory floor at once). Uses the same local-
+%   maxima + DC-exclusion + threshold logic as detectDominantPeak(),
+%   just without stopping at the first/best candidate.
+%
+%   Inputs:
+%     magSpectrum - single-sided magnitude spectrum, bin 1 = DC
+%     thresholdKg - minimum peak magnitude to be considered real
+%
+%   Output:
+%     peakIdxList - bin indices of all qualifying peaks, sorted by
+%                   descending magnitude (strongest source first)
+
+    idxList = [];
+    magList = [];
+
+    for i = 3:length(magSpectrum)-1
+        isLocalMax = magSpectrum(i) > magSpectrum(i-1) && ...
+                     magSpectrum(i) > magSpectrum(i+1);
+        if isLocalMax && magSpectrum(i) >= thresholdKg
+            idxList(end+1) = i;            %#ok<AGROW>
+            magList(end+1) = magSpectrum(i); %#ok<AGROW>
+        end
+    end
+
+    [~, order] = sort(magList, 'descend');
+    peakIdxList = idxList(order);
+end
+
+function names = identifySources(freqs, machineDB, toleranceHz)
+% identifySources  Match detected frequencies against the known machine
+%                   database (machineDB) to name the "foreign system"
+%                   responsible for each vibration.
+%
+%   For each frequency, finds the closest machineDB entry; if it's
+%   within toleranceHz, that machine's name is returned, otherwise the
+%   frequency is reported as an unknown/unregistered source.
+%
+%   Inputs:
+%     freqs        - row vector of detected frequencies (Hz)
+%     machineDB    - struct array with fields .name and .freq
+%     toleranceHz  - maximum allowed mismatch to accept a match (Hz)
+%
+%   Output:
+%     names - cell array of matched (or "Unknown") names, same length
+%             as freqs
+
+    names = cell(1, numel(freqs));
+
+    for i = 1:numel(freqs)
+        f = freqs(i);
+        bestIdx  = 0;
+        bestDiff = inf;
+
+        for m = 1:numel(machineDB)
+            d = abs(f - machineDB(m).freq);
+            if d < bestDiff
+                bestDiff = d;
+                bestIdx  = m;
+            end
+        end
+
+        if bestIdx > 0 && bestDiff <= toleranceHz
+            names{i} = machineDB(bestIdx).name;
+        else
+            names{i} = sprintf('Unknown source (%.2f Hz)', f);
+        end
+    end
+end
+
+function freqs = getReferenceFrequencies(testCase)
+% getReferenceFrequencies  Return the "true" vibration frequency/
+%                           frequencies for a given test case, purely
+%                           for annotating Plot 5 so detection accuracy
+%                           can be checked visually against ground truth.
+%
+%   Input:
+%     testCase - 1..5
+%
+%   Output:
+%     freqs - row vector of reference frequencies in Hz (empty if none)
+
+    switch testCase
+        case 1
+            freqs = [];                  % no vibration to reference
+        case 2
+            freqs = 20;
+        case 3
+            freqs = [10, 20, 35];
+        case 4
+            freqs = [10, 25, 35];        % shown as static references;
+                                          % actual frequency steps with time
+        case 5
+            freqs = [8, 12, 18, 25, 32, 38];
+        otherwise
+            freqs = [];
+    end
+end
